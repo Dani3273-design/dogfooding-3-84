@@ -1,0 +1,160 @@
+#!/bin/bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+print_banner() {
+    echo -e "${BOLD}${CYAN}"
+    echo "========================================"
+    echo "   System Monitor Dependencies Installer"
+    echo "========================================"
+    echo -e "${RESET}"
+}
+
+get_os() {
+    case "$(uname -s)" in
+        Darwin*)    echo "macos" ;;
+        Linux*)     echo "linux" ;;
+        *)          echo "unknown" ;;
+    esac
+}
+
+check_command() {
+    if command -v $1 &> /dev/null; then
+        echo -e "${GREEN}✓${RESET} $1 is already installed"
+        return 0
+    else
+        echo -e "${YELLOW}✗${RESET} $1 is not installed"
+        return 1
+    fi
+}
+
+install_macos() {
+    echo -e "${BOLD}Installing dependencies for macOS...${RESET}"
+    echo ""
+    
+    if ! check_command brew; then
+        echo -e "${YELLOW}Installing Homebrew...${RESET}"
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+    
+    echo ""
+    echo -e "${BOLD}Installing required packages...${RESET}"
+    
+    local packages=("bc" "sysstat" "iostat")
+    
+    for pkg in "${packages[@]}"; do
+        case $pkg in
+            bc)
+                if ! check_command bc; then
+                    echo -e "${YELLOW}Installing bc...${RESET}"
+                    brew install bc
+                fi
+                ;;
+            sysstat)
+                if ! check_command iostat; then
+                    echo -e "${YELLOW}Installing sysstat (includes iostat)...${RESET}"
+                    brew install sysstat
+                fi
+                ;;
+            iostat)
+                :
+                ;;
+        esac
+    done
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}macOS installation complete!${RESET}"
+}
+
+install_linux() {
+    echo -e "${BOLD}Installing dependencies for Linux (Ubuntu 24.04)...${RESET}"
+    echo ""
+    
+    echo -e "${YELLOW}Updating package lists...${RESET}"
+    sudo apt-get update
+    
+    echo ""
+    echo -e "${BOLD}Installing required packages...${RESET}"
+    
+    local packages=("bc" "sysstat" "net-tools")
+    
+    for pkg in "${packages[@]}"; do
+        if ! check_command $pkg; then
+            echo -e "${YELLOW}Installing $pkg...${RESET}"
+            sudo apt-get install -y $pkg
+        fi
+    done
+    
+    echo ""
+    echo -e "${GREEN}${BOLD}Linux installation complete!${RESET}"
+}
+
+print_banner
+
+OS=$(get_os)
+echo -e "${BOLD}Detected OS: ${CYAN}${OS}${RESET}"
+echo ""
+
+if [ "$OS" = "macos" ]; then
+    install_macos
+elif [ "$OS" = "linux" ]; then
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [[ "$ID" == "ubuntu" ]] || [[ "$ID_LIKE" == *"ubuntu"* ]] || [[ "$ID" == "debian" ]]; then
+            install_linux
+        else
+            echo -e "${YELLOW}Warning: This script is optimized for Ubuntu 24.04.${RESET}"
+            echo -e "${YELLOW}Attempting to install for generic Linux...${RESET}"
+            install_linux
+        fi
+    else
+        echo -e "${YELLOW}Warning: Cannot detect Linux distribution.${RESET}"
+        install_linux
+    fi
+else
+    echo -e "${RED}Error: Unsupported operating system: $OS${RESET}"
+    echo -e "${YELLOW}This script only supports Ubuntu 24.04 and macOS.${RESET}"
+    exit 1
+fi
+
+echo ""
+echo -e "${BOLD}${CYAN}========================================${RESET}"
+echo -e "${BOLD}Verifying installation...${RESET}"
+echo -e "${BOLD}${CYAN}========================================${RESET}"
+echo ""
+
+all_installed=true
+
+if check_command bc; then
+    :
+else
+    all_installed=false
+fi
+
+if [ "$OS" = "linux" ]; then
+    if check_command iostat; then
+        :
+    else
+        all_installed=false
+    fi
+fi
+
+echo ""
+if [ "$all_installed" = true ]; then
+    echo -e "${GREEN}${BOLD}All dependencies are installed successfully!${RESET}"
+    echo ""
+    echo -e "${BOLD}You can now run the monitor with:${RESET}"
+    echo -e "${CYAN}    ./main.shell [refresh_interval]${RESET}"
+    echo ""
+    echo -e "${BOLD}Example:${RESET}"
+    echo -e "${CYAN}    ./main.shell 2${RESET}"
+else
+    echo -e "${RED}${BOLD}Some dependencies failed to install.${RESET}"
+    echo -e "${YELLOW}Please install them manually and try again.${RESET}"
+    exit 1
+fi

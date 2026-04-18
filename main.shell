@@ -1,0 +1,422 @@
+#!/bin/bash
+
+REFRESH_INTERVAL=${1:-2}
+
+if [[ "$REFRESH_INTERVAL" =~ ^[0-9]+$ ]] && [ "$REFRESH_INTERVAL" -gt 0 ]; then
+    :
+else
+    echo "Usage: $0 [refresh_interval_seconds]"
+    echo "Example: $0 2"
+    exit 1
+fi
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLACK='\033[0;30m'
+WHITE='\033[0;37m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
+BG_WHITE='\033[47m'
+
+get_color() {
+    local value=$1
+    if (( $(echo "$value < 30" | bc -l) )); then
+        echo -e "${WHITE}"
+    elif (( $(echo "$value < 80" | bc -l) )); then
+        echo -e "${YELLOW}"
+    elif (( $(echo "$value < 95" | bc -l) )); then
+        echo -e "${BG_WHITE}${BLACK}"
+    else
+        echo -e "${RED}"
+    fi
+}
+
+get_os() {
+    case "$(uname -s)" in
+        Darwin*)    echo "macos" ;;
+        Linux*)     echo "linux" ;;
+        *)          echo "unknown" ;;
+    esac
+}
+
+OS=$(get_os)
+
+get_cpu_usage() {
+    if [ "$OS" = "linux" ]; then
+        if [ -f /proc/stat ]; then
+            local cpu_line=$(head -1 /proc/stat)
+            local idle=$(echo $cpu_line | awk '{print $5}')
+            local total=0
+            for i in $(echo $cpu_line | awk '{for(i=2;i<=8;i++) print $i}'); do
+                total=$((total + i))
+            done
+            echo "$idle $total"
+        else
+            echo "0 100"
+        fi
+    else
+        local cpu_usage=$(top -l 1 -n 0 | grep "CPU usage" | awk '{print $3}' | sed 's/%//')
+        if [ -n "$cpu_usage" ]; then
+            local idle=$(echo "100 - $cpu_usage" | bc)
+            echo "$idle 100"
+        else
+            echo "0 100"
+        fi
+    fi
+}
+
+PREV_CPU_IDLE=0
+PREV_CPU_TOTAL=0
+
+calculate_cpu() {
+    local idle=$1
+    local total=$2
+    
+    if [ "$PREV_CPU_TOTAL" -eq 0 ]; then
+        PREV_CPU_IDLE=$idle
+        PREV_CPU_TOTAL=$total
+        echo "0.0"
+        return
+    fi
+    
+    local diff_idle=$((idle - PREV_CPU_IDLE))
+    local diff_total=$((total - PREV_CPU_TOTAL))
+    
+    if [ "$diff_total" -eq 0 ]; then
+        echo "0.0"
+        return
+    fi
+    
+    local cpu_usage=$(echo "scale=1; 100 * (1 - $diff_idle / $diff_total)" | bc)
+    PREV_CPU_IDLE=$idle
+    PREV_CPU_TOTAL=$total
+    echo "$cpu_usage"
+}
+
+get_memory_usage() {
+    if [ "$OS" = "linux" ]; then
+        local mem_info=$(free -m | grep "Mem:")
+        local total=$(echo $mem_info | awk '{print $2}')
+        local used=$(echo $mem_info | awk '{print $3}')
+        if [ "$total" -gt 0 ]; then
+            local percent=$(echo "scale=1; $used * 100 / $total" | bc)
+            echo "$percent"
+        else
+            echo "0.0"
+        fi
+    else
+        local mem_info=$(vm_stat)
+        local page_size=4096
+        
+        local free_pages=$(echo "$mem_info" | grep "free" | awk '{print $3}' | sed 's/\.//')
+        local inactive_pages=$(echo "$mem_info" | grep "inactive" | awk '{print $3}' | sed 's/\.//')
+        local active_pages=$(echo "$mem_info" | grep " active" | awk '{print $3}' | sed 's/\.//')
+        local wired_pages=$(echo "$mem_info" | grep "wired" | awk '{print $4}' | sed 's/\.//')
+        
+        free_pages=${free_pages:-0}
+        inactive_pages=${inactive_pages:-0}
+        active_pages=${active_pages:-0}
+        wired_pages=${wired_pages:-0}
+        
+        local total_mem=$(sysctl -n hw.memsize)
+        
+        local used_bytes=$(echo "($active_pages + $wired_pages) * $page_size" | bc)
+        local percent=$(echo "scale=1; $used_bytes * 100 / $total_mem" | bc)
+        
+        echo "$percent"
+    fi
+}
+
+get_network_interfaces() {
+    if [ "$OS" = "linux" ]; then
+        ls /sys/class/net/ | grep -v lo
+    else
+        ifconfig | grep -E "^[a-z]" | awk -F: '{print $1}' | grep -v -E "^(lo|bridge|utun|awdl|llw)"
+    fi
+}
+
+get_network_bytes() {
+    local interface=$1
+    local direction=$2
+    
+    if [ "$OS" = "linux" ]; then
+        if [ "$direction" = "rx" ]; then
+            cat /sys/class/net/$interface/statistics/rx_bytes 2>/dev/null || echo "0"
+        else
+            cat /sys/class/net/$interface/statistics/tx_bytes 2>/dev/null || echo "0"
+        fi
+    else
+        local netstat_line=$(netstat -ibn | grep -E "^$interface" | head -1)
+        if [ -n "$netstat_line" ]; then
+            if [ "$direction" = "rx" ]; then
+                echo "$netstat_line" | awk '{print $7}'
+            else
+                echo "$netstat_line" | awk '{print $10}'
+            fi
+        else
+            echo "0"
+        fi
+    fi
+}
+
+PREV_NET_DATA=""
+
+calculate_bandwidth() {
+    local interface=$1
+    local current_rx=$2
+    local current_tx=$3
+    local current_time=$(python3 -c "import time; print(time.time())")
+    
+    local found=0
+    local prev_rx=0
+    local prev_tx=0
+    local prev_time=0
+    
+    if [ -n "$PREV_NET_DATA" ]; then
+        while IFS='|' read -r iface rx tx ts; do
+            if [ "$iface" = "$interface" ]; then
+                prev_rx=$rx
+                prev_tx=$tx
+                prev_time=$ts
+                found=1
+                break
+            fi
+        done <<< "$PREV_NET_DATA"
+    fi
+    
+    if [ "$found" -eq 0 ]; then
+        PREV_NET_DATA="${PREV_NET_DATA}${interface}|${current_rx}|${current_tx}|${current_time}
+"
+        echo "0.00 0.00"
+        return
+    fi
+    
+    local time_diff=$(echo "$current_time - $prev_time" | bc)
+    if [ $(echo "$time_diff <= 0" | bc) -eq 1 ]; then
+        time_diff=1
+    fi
+    
+    local rx_diff=$((current_rx - prev_rx))
+    local tx_diff=$((current_tx - prev_tx))
+    
+    if [ $rx_diff -lt 0 ]; then rx_diff=0; fi
+    if [ $tx_diff -lt 0 ]; then tx_diff=0; fi
+    
+    local rx_rate=$(echo "scale=2; $rx_diff / $time_diff / 1024" | bc)
+    local tx_rate=$(echo "scale=2; $tx_diff / $time_diff / 1024" | bc)
+    
+    PREV_NET_DATA=$(echo "$PREV_NET_DATA" | grep -v "^${interface}|")
+    PREV_NET_DATA="${PREV_NET_DATA}${interface}|${current_rx}|${current_tx}|${current_time}
+"
+    
+    echo "$rx_rate $tx_rate"
+}
+
+PREV_DISK_READ=0
+PREV_DISK_WRITE=0
+PREV_DISK_TIME=0
+
+get_disk_io() {
+    if [ "$OS" = "linux" ]; then
+        local disk_stats=$(cat /proc/diskstats | head -1)
+        local read_sectors=$(echo $disk_stats | awk '{print $6}')
+        local write_sectors=$(echo $disk_stats | awk '{print $10}')
+        echo "$read_sectors $write_sectors"
+    else
+        local disk_info=$(iostat -d 2>/dev/null | tail -1)
+        if [ -n "$disk_info" ]; then
+            local read_mb=$(echo $disk_info | awk '{print $5}')
+            local write_mb=$(echo $disk_info | awk '{print $6}')
+            read_mb=${read_mb:-0}
+            write_mb=${write_mb:-0}
+            local read_kb=$(echo "$read_mb * 1024" | bc)
+            local write_kb=$(echo "$write_mb * 1024" | bc)
+            echo "$read_kb $write_kb"
+        else
+            echo "0 0"
+        fi
+    fi
+}
+
+calculate_disk_io() {
+    local read_val=$1
+    local write_val=$2
+    local current_time=$(python3 -c "import time; print(time.time())")
+    
+    if [ "$PREV_DISK_TIME" = "0" ]; then
+        PREV_DISK_READ=$read_val
+        PREV_DISK_WRITE=$write_val
+        PREV_DISK_TIME=$current_time
+        echo "0.00 0.00"
+        return
+    fi
+    
+    local time_diff=$(echo "$current_time - $PREV_DISK_TIME" | bc)
+    if [ $(echo "$time_diff <= 0" | bc) -eq 1 ]; then
+        time_diff=1
+    fi
+    
+    local read_diff=$(echo "$read_val - $PREV_DISK_READ" | bc)
+    local write_diff=$(echo "$write_val - $PREV_DISK_WRITE" | bc)
+    
+    if [ $(echo "$read_diff < 0" | bc) -eq 1 ]; then read_diff=0; fi
+    if [ $(echo "$write_diff < 0" | bc) -eq 1 ]; then write_diff=0; fi
+    
+    local read_rate=$(echo "scale=2; $read_diff / $time_diff" | bc)
+    local write_rate=$(echo "scale=2; $write_diff / $time_diff" | bc)
+    
+    PREV_DISK_READ=$read_val
+    PREV_DISK_WRITE=$write_val
+    PREV_DISK_TIME=$current_time
+    
+    echo "$read_rate $write_rate"
+}
+
+format_size() {
+    local size=$1
+    if [ -z "$size" ]; then
+        printf "%8s" "0.00 KB/s"
+        return
+    fi
+    if [ $(echo "$size >= 1024" | bc) -eq 1 ]; then
+        local mb=$(echo "scale=2; $size / 1024" | bc)
+        printf "%8s" "${mb} MB/s"
+    else
+        printf "%8s" "${size} KB/s"
+    fi
+}
+
+format_rate() {
+    local rate=$1
+    if [ -z "$rate" ]; then
+        printf "%7.2f" 0.00
+        return
+    fi
+    printf "%7.2f" "$rate"
+}
+
+print_bar() {
+    local percent=$1
+    local width=30
+    local filled=$(echo "$percent * $width / 100" | bc)
+    filled=${filled:-0}
+    if [ "$filled" -gt "$width" ]; then
+        filled=$width
+    fi
+    local empty=$((width - filled))
+    
+    local color=$(get_color $percent)
+    
+    printf "["
+    local i=0
+    while [ $i -lt $filled ]; do
+        printf "${color}█${RESET}"
+        i=$((i + 1))
+    done
+    i=0
+    while [ $i -lt $empty ]; do
+        printf "░"
+        i=$((i + 1))
+    done
+    printf "] "
+    printf "${color}%5.1f%%${RESET}" "$percent"
+}
+
+trap 'tput cnorm; printf "\033[H\033[J"; echo -e "${GREEN}Monitor stopped.${RESET}"; exit 0' INT TERM
+
+tput civis
+
+get_cpu_usage > /dev/null 2>&1
+
+INTERFACES=$(get_network_interfaces)
+IFACE_COUNT=$(echo "$INTERFACES" | wc -l | tr -d ' ')
+
+while true; do
+    printf "\033[H"
+    
+    echo -e "${BOLD}${CYAN}========================================${RESET}"
+    echo -e "${BOLD}${CYAN}       System Resource Monitor${RESET}"
+    echo -e "${BOLD}${CYAN}========================================${RESET}"
+    echo -e "${BOLD}Refresh Interval: ${GREEN}${REFRESH_INTERVAL}s${RESET}    ${BOLD}OS: ${GREEN}${OS}${RESET}"
+    echo -e "${BOLD}${CYAN}----------------------------------------${RESET}"
+    echo ""
+    
+    cpu_raw=$(get_cpu_usage)
+    cpu_idle=$(echo $cpu_raw | awk '{print $1}')
+    cpu_total=$(echo $cpu_raw | awk '{print $2}')
+    cpu_percent=$(calculate_cpu $cpu_idle $cpu_total)
+    echo -e "${BOLD}CPU Usage:${RESET}"
+    print_bar "$cpu_percent"
+    echo ""
+    echo ""
+    
+    mem_percent=$(get_memory_usage)
+    echo -e "${BOLD}Memory Usage:${RESET}"
+    print_bar "$mem_percent"
+    echo ""
+    echo ""
+    
+    echo -e "${CYAN}----------------------------------------${RESET}"
+    echo -e "${BOLD}Network Bandwidth (per interface):${RESET}"
+    echo ""
+    
+    for iface in $INTERFACES; do
+        rx_bytes=$(get_network_bytes $iface rx)
+        tx_bytes=$(get_network_bytes $iface tx)
+        bandwidth=$(calculate_bandwidth $iface $rx_bytes $tx_bytes)
+        rx_rate=$(echo $bandwidth | awk '{print $1}')
+        tx_rate=$(echo $bandwidth | awk '{print $2}')
+        
+        total_rate=$(echo "$rx_rate + $tx_rate" | bc)
+        total_rate=${total_rate:-0}
+        max_bandwidth=10240
+        bandwidth_percent=$(echo "scale=1; $total_rate * 100 / $max_bandwidth" | bc)
+        bandwidth_percent=${bandwidth_percent:-0}
+        if [ $(echo "$bandwidth_percent > 100" | bc) -eq 1 ]; then
+            bandwidth_percent=100
+        fi
+        
+        color=$(get_color $bandwidth_percent)
+        
+        printf "  ${BOLD}%-8s${RESET} " "$iface:"
+        echo -e "${color}↓$(format_rate $rx_rate) KB/s  ↑$(format_rate $tx_rate) KB/s${RESET}"
+    done
+    
+    echo ""
+    echo -e "${CYAN}----------------------------------------${RESET}"
+    echo -e "${BOLD}Disk I/O:${RESET}"
+    echo ""
+    
+    disk_raw=$(get_disk_io)
+    read_val=$(echo $disk_raw | awk '{print $1}')
+    write_val=$(echo $disk_raw | awk '{print $2}')
+    disk_io=$(calculate_disk_io "$read_val" "$write_val")
+    read_rate=$(echo $disk_io | awk '{print $1}')
+    write_rate=$(echo $disk_io | awk '{print $2}')
+    
+    total_io=$(echo "$read_rate + $write_rate" | bc)
+    total_io=${total_io:-0}
+    max_io=102400
+    io_percent=$(echo "scale=1; $total_io * 100 / $max_io" | bc)
+    io_percent=${io_percent:-0}
+    if [ $(echo "$io_percent > 100" | bc) -eq 1 ]; then
+        io_percent=100
+    fi
+    
+    color=$(get_color $io_percent)
+    
+    printf "  ${BOLD}Read:${RESET}   "
+    echo -e "${color}$(format_size $read_rate)${RESET}"
+    printf "  ${BOLD}Write:${RESET}  "
+    echo -e "${color}$(format_size $write_rate)${RESET}"
+    
+    echo ""
+    echo -e "${CYAN}----------------------------------------${RESET}"
+    echo -e "${BOLD}Press Ctrl+C to exit${RESET}"
+    
+    printf "\033[J"
+    
+    sleep $REFRESH_INTERVAL
+done
